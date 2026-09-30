@@ -33,3 +33,10 @@ export const tooManyRequests = (retryAfterSeconds: number): HttpError =>
     `Too many requests. Retry in ${retryAfterSeconds}s`,
     "rate_limited",
   );
+
+/// Operator-facing, like [badRequest]: the message says what to do next.
+export const conflict = (message: string): HttpError =>
+  new HttpError(409, message);
+
+export const serviceUnavailable = (message: string): HttpError =>
+  new HttpError(503, message);

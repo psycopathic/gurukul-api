@@ -22,8 +22,15 @@ export interface VideoRecord {
   /// Logical bucket from `config/buckets.ts` — not a bucket name.
   readonly bucket: BucketId;
 
-  /// Object key inside that bucket. Internal: never returned to the client.
-  readonly objectKey: string;
+  /// Legacy: a single pre-encoded object, served exactly as uploaded. Internal:
+  /// never returned to the client.
+  ///
+  /// Leave it out for a processed video. Those live under `videos/<id>/` (see
+  /// `video-layout.ts`) and play the 720p rendition once processing is done.
+  /// Moving a legacy video over is `POST /api/videos/<id>/process` with
+  /// `{ "sourceKey": "<its objectKey>" }`, then deleting this field once the
+  /// status reads `READY`.
+  readonly objectKey?: string;
 
   readonly access: AccessRule;
 }
@@ -37,7 +44,6 @@ export const VIDEO_CATALOG: readonly VideoRecord[] = [
   {
     id: "ganesha_elephant_head",
     bucket: "videos",
-    objectKey: "video/ganesha_elephant_head.mp4",
     access: { kind: "authenticated" },
   },
 ];

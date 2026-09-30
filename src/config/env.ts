@@ -1,3 +1,4 @@
+import os from "node:os";
 import dotenv from "dotenv";
 import {
   BUCKET_DEFINITIONS,
@@ -93,6 +94,17 @@ export const env = {
   playbackRateLimit: {
     max: requireInt("PLAYBACK_RATE_LIMIT_MAX", 30, 10000),
     windowSeconds: requireInt("PLAYBACK_RATE_LIMIT_WINDOW_SECONDS", 60, 86400),
+  },
+
+  /// Server-side transcoding of uploaded originals into the playback MP4. Only
+  /// instances that run processing jobs need FFmpeg installed; playback does not.
+  videoProcessing: {
+    ffmpegPath: process.env.FFMPEG_PATH?.trim() || "ffmpeg",
+    ffprobePath: process.env.FFPROBE_PATH?.trim() || "ffprobe",
+
+    /// Scratch space for one original plus its encode, deleted after every job.
+    /// Point it at real disk where `/tmp` is a RAM-backed tmpfs.
+    tmpDir: process.env.VIDEO_PROCESSING_TMP_DIR?.trim() || os.tmpdir(),
   },
 
   buckets: bucketConfigs,

@@ -25,6 +25,9 @@ Gurukul Video API ──1. verify App Check (is this our app?) ──┘
 | `GET` | `/health` | none | liveness |
 | `GET` | `/api/videos/:videoId/play` | App Check + Firebase ID token | playback authorization → signed URL |
 | `POST` | `/api/videos/upload-url` | `ADMIN_API_TOKEN` | operator-only: presign an upload (**validation currently off** — see below) |
+| `POST` | `/api/videos/:videoId/original/upload-url` | `ADMIN_API_TOKEN` | operator-only: presign the PUT for a video's original |
+| `POST` | `/api/videos/:videoId/process` | `ADMIN_API_TOKEN` | operator-only: transcode the original to 720p in the background → `202` |
+| `GET` | `/api/videos/:videoId/status` | `ADMIN_API_TOKEN` | operator-only: `UPLOADING` / `PROCESSING` / `READY` / `FAILED` |
 
 ### `GET /api/videos/:videoId/play`
 
@@ -37,11 +40,16 @@ X-Firebase-AppCheck: <app-check-token>
 ```json
 {
   "videoId": "ganesha_elephant_head",
+  "status": "READY",
   "videoUrl": "https://<account>.r2.cloudflarestorage.com/<bucket>/video/...?X-Amz-...",
   "expiresIn": 1800,
   "expiresAt": "2026-09-25T10:30:00.000Z"
 }
 ```
+
+A processed video with nothing playable yet answers `200` with only
+`{ "videoId": "...", "status": "UPLOADING" | "PROCESSING" | "FAILED" }` — no URL.
+The high-bitrate original is never served in its place.
 
 `401` unauthenticated · `403` not allowed to watch this video · `404` no such
 video · `429` rate limited. The response carries nothing else — no object key,
@@ -81,6 +89,42 @@ grant the claim server-side (`setCustomUserClaims`) wherever that decision is
 made. The client never participates in the decision.
 
 ## Adding a video
+
+Videos are transcoded server-side into a 720p MP4 (~3 Mbps, `+faststart`) and
+the app plays that, never the original. A 1080p master at ~21 Mbps stalls on
+mobile networks; the rendition is ~7× smaller and plays on a ~4 Mbps connection.
+
+```text
+videos/<id>/original.mp4   the upload, kept as the master
+videos/<id>/720p.mp4       what /play signs
+videos/<id>/status.json    UPLOADING → PROCESSING → READY | FAILED
+```
+
+1. `POST /api/videos/<id>/original/upload-url`, then `PUT` the file to the
+   returned URL (`Content-Type: video/mp4`). It goes straight to R2.
+2. `POST /api/videos/<id>/process` → `202`. FFmpeg runs in the background on
+   this instance; jobs run one at a time.
+3. Poll `GET /api/videos/<id>/status` until `READY` (`rendition` has the output's
+   size, dimensions and bitrate). On `FAILED`, `failureReason` names the stage and
+   the logs have FFmpeg's message; fix the original and call `process` again.
+4. Add `{ id, bucket: "videos", access }` — no `objectKey` — to
+   `src/catalog/video-catalog.ts`, and the id to the app's `assets/data/video.json`.
+
+Re-uploading or reprocessing a published video keeps its current 720p file
+playing until the new one is ready, and a failed reprocess leaves it in place.
+
+**Moving a legacy entry over** (one with an `objectKey`): `POST
+/api/videos/<id>/process` with `{ "sourceKey": "<its objectKey>" }` copies the
+object into `videos/<id>/original.mp4` inside R2 and processes it. Once the
+status reads `READY`, delete `objectKey` from the catalog entry and deploy.
+
+Processing needs `ffmpeg` and `ffprobe` (with libx264) on the instance —
+`FFMPEG_PATH` / `FFPROBE_PATH` if they are not on `PATH` — and free space in
+`VIDEO_PROCESSING_TMP_DIR` for the original plus its encode. Without FFmpeg,
+`process` answers `503` and says so; playback is unaffected. The encode settings
+are `PLAYBACK_PROFILE` in `src/services/transcoder.service.ts`.
+
+### Legacy: single-object upload
 
 1. `POST /api/videos/upload-url` with the operator token, then `PUT` the file to
    the URL it returns.
@@ -222,7 +266,12 @@ One JSON line per event, via `src/services/logger.ts`:
 `video_playback_authorization_granted`, `video_playback_authorization_denied`,
 `video_not_found`, `video_signed_url_generated`, `video_playback_rate_limited`,
 `auth_token_rejected`, `app_check_verified`, `app_check_token_missing`,
-`app_check_token_invalid`, `unhandled_error`. Signed URLs are logged as host + path
+`app_check_token_invalid`, `unhandled_error`, and for processing
+`video_processing_queued`, `video_processing_started`,
+`video_original_downloaded`, `video_ffmpeg_started`, `video_ffmpeg_completed`,
+`video_rendition_uploaded`, `video_processing_completed`,
+`video_processing_failed` (with `reason` and FFmpeg's stderr tail),
+`video_processing_cleanup_failed`, `video_ffmpeg_unavailable`. Signed URLs are logged as host + path
 only — every `X-Amz-*` parameter, the signature included, is stripped — and any
 field whose name looks like a secret is redacted.
 

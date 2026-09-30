@@ -1,19 +1,26 @@
+import { videoObjectKeys } from "../catalog/video-layout";
 import { forbidden, notFound } from "../errors";
 import type { AppUser } from "../types/app-user";
-import type { VideoPlaybackAccess } from "../types/video.types";
+import type { VideoPlaybackResponse } from "../types/video.types";
 import { findVideoById } from "./catalog.service";
 import { authorizePlayback } from "./entitlement.service";
 import { LogEvent, logger, redactSignedUrl } from "./logger";
 import { createDownloadUrl } from "./r2.service";
+import { readVideoStatus } from "./video-status.service";
 
 /// Authorize a user for one video and mint a short-lived R2 URL for it.
 ///
 /// Order matters: look the video up, authorize, *then* sign. A signed URL is
 /// never created for a request that would have been refused.
+///
+/// A processed video plays its 720p rendition and nothing else. Until one has
+/// been published the answer is its status with no URL — the original is never
+/// offered instead, since serving the 21 Mbps master is what processing exists
+/// to avoid.
 export async function grantPlaybackAccess(
   videoId: string,
   user: AppUser,
-): Promise<VideoPlaybackAccess> {
+): Promise<VideoPlaybackResponse> {
   const video = await findVideoById(videoId);
 
   if (!video) {
@@ -33,7 +40,20 @@ export async function grantPlaybackAccess(
     throw forbidden(decision.reason);
   }
 
-  const signed = await createDownloadUrl(video.bucket, video.objectKey);
+  let objectKey = video.objectKey;
+  if (objectKey === undefined) {
+    const record = await readVideoStatus(video.bucket, video.id);
+    if (!record?.rendition) {
+      // No status means nothing has been uploaded for this id yet. (`READY`
+      // is only ever written together with a rendition, so it cannot get here.)
+      const status = record && record.status !== "READY" ? record.status : "UPLOADING";
+      logger.info(LogEvent.videoNotReady, { videoId, uid: user.uid, status });
+      return { videoId, status };
+    }
+    objectKey = videoObjectKeys(video.id).playback;
+  }
+
+  const signed = await createDownloadUrl(video.bucket, objectKey);
 
   logger.info(LogEvent.playbackAuthorizationGranted, {
     videoId,
@@ -52,6 +72,7 @@ export async function grantPlaybackAccess(
 
   return {
     videoId,
+    status: "READY",
     videoUrl: signed.url,
     expiresIn: signed.expiresIn,
     expiresAt: signed.expiresAt,

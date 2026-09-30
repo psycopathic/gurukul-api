@@ -1,5 +1,11 @@
+import { createReadStream, createWriteStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
+  CopyObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -88,6 +94,128 @@ export async function createUploadUrl(
   );
 
   return signedUrlResult(url, expiresIn);
+}
+
+/// Server-side object operations, used by video processing. Unlike presigning,
+/// these talk to R2, so they sit behind [setObjectStore] for tests.
+///
+/// Objects are streamed to and from disk, never buffered: an original can be
+/// hundreds of megabytes.
+export interface ObjectStore {
+  exists(bucket: BucketId, key: string): Promise<boolean>;
+
+  /// Streams an object into `filePath`. Returns the bytes written.
+  downloadToFile(bucket: BucketId, key: string, filePath: string): Promise<number>;
+
+  uploadFile(
+    bucket: BucketId,
+    key: string,
+    filePath: string,
+    contentType: string,
+  ): Promise<void>;
+
+  /// A small text object, or `undefined` when there is none.
+  getText(bucket: BucketId, key: string): Promise<string | undefined>;
+
+  putText(bucket: BucketId, key: string, body: string, contentType: string): Promise<void>;
+
+  /// Server-side copy within one bucket. Nothing passes through this process.
+  copy(bucket: BucketId, fromKey: string, toKey: string): Promise<void>;
+}
+
+function isNotFound(error: unknown): boolean {
+  const candidate = error as { name?: string; $metadata?: { httpStatusCode?: number } };
+  return (
+    candidate.name === "NoSuchKey" ||
+    candidate.name === "NotFound" ||
+    candidate.$metadata?.httpStatusCode === 404
+  );
+}
+
+const r2ObjectStore: ObjectStore = {
+  async exists(bucket, key) {
+    try {
+      await clientFor(bucket).send(
+        new HeadObjectCommand({ Bucket: bucketConfig(bucket).bucketName, Key: key }),
+      );
+      return true;
+    } catch (error) {
+      if (isNotFound(error)) return false;
+      throw error;
+    }
+  },
+
+  async downloadToFile(bucket, key, filePath) {
+    const response = await clientFor(bucket).send(
+      new GetObjectCommand({ Bucket: bucketConfig(bucket).bucketName, Key: key }),
+    );
+    if (!(response.Body instanceof Readable)) {
+      throw new Error(`R2 returned no readable body for ${key}`);
+    }
+    await pipeline(response.Body, createWriteStream(filePath));
+    return (await stat(filePath)).size;
+  },
+
+  async uploadFile(bucket, key, filePath, contentType) {
+    // A stream body needs an explicit length; without it the SDK cannot sign
+    // the request. Single-part PUT caps the file at 5 GiB, far above a 720p
+    // rendition of anything Gurukul publishes.
+    const { size } = await stat(filePath);
+    await clientFor(bucket).send(
+      new PutObjectCommand({
+        Bucket: bucketConfig(bucket).bucketName,
+        Key: key,
+        Body: createReadStream(filePath),
+        ContentLength: size,
+        ContentType: contentType,
+      }),
+    );
+  },
+
+  async getText(bucket, key) {
+    try {
+      const response = await clientFor(bucket).send(
+        new GetObjectCommand({ Bucket: bucketConfig(bucket).bucketName, Key: key }),
+      );
+      return await response.Body?.transformToString("utf-8");
+    } catch (error) {
+      if (isNotFound(error)) return undefined;
+      throw error;
+    }
+  },
+
+  async putText(bucket, key, body, contentType) {
+    await clientFor(bucket).send(
+      new PutObjectCommand({
+        Bucket: bucketConfig(bucket).bucketName,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      }),
+    );
+  },
+
+  async copy(bucket, fromKey, toKey) {
+    const { bucketName } = bucketConfig(bucket);
+    await clientFor(bucket).send(
+      new CopyObjectCommand({
+        Bucket: bucketName,
+        Key: toKey,
+        CopySource: `${bucketName}/${fromKey.split("/").map(encodeURIComponent).join("/")}`,
+      }),
+    );
+  },
+};
+
+let activeStore: ObjectStore = r2ObjectStore;
+
+/// Test seam: swap R2 for a local fake. `undefined` restores R2.
+export function setObjectStore(next: ObjectStore | undefined): void {
+  activeStore = next ?? r2ObjectStore;
+}
+
+export function objectStore(): ObjectStore {
+  return activeStore;
 }
 
 /// Test seam: drop cached clients so a changed configuration is picked up.
