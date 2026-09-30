@@ -1,8 +1,11 @@
 import { Router } from "express";
 import { env } from "../config/env";
 import {
+  getOriginalUploadUrl,
   getPlaybackAccess,
+  getProcessingStatus,
   getUploadUrl,
+  processVideoOriginal,
 } from "../controllers/video.controller";
 import { requireAppCheck } from "../middleware/app-check.middleware";
 import { requireAppUser, requireOperator } from "../middleware/auth.middleware";
@@ -23,3 +26,6 @@ videoRouter.get(
 
 /// Operator-only content publishing. Not used by the app.
 videoRouter.post("/upload-url", requireOperator, getUploadUrl);
+videoRouter.post("/:videoId/original/upload-url", requireOperator, getOriginalUploadUrl);
+videoRouter.post("/:videoId/process", requireOperator, processVideoOriginal);
+videoRouter.get("/:videoId/status", requireOperator, getProcessingStatus);
